@@ -1,0 +1,33 @@
+# release-please opens or updates the release pull request. The pull request changes CHANGELOG.md and version.txt.
+# When you merge the release pull request, release-please creates the tag and the release. Then this workflow starts
+# the release workflow on the tag, which uploads the plugin to the release.
+
+name: release-please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      # A tag that GITHUB_TOKEN pushes does not start other workflows. Thus, start the release workflow explicitly.
+      - name: 'Run: release workflow'
+        if: ${{ steps.release.outputs.release_created }}
+        run: gh workflow run release.yml --ref ${{ steps.release.outputs.tag_name }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

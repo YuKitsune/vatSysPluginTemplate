@@ -1,0 +1,433 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net.Http;
+using System.Runtime.Versioning;
+using Fallout.Common;
+using Fallout.Common.CI.GitHubActions;
+using Fallout.Common.Git;
+using Fallout.Common.IO;
+using Fallout.Common.Tools.DotNet;
+using Fallout.Common.Tools.GitHub;
+using Fallout.Common.Tools.ILRepack;
+using Octokit;
+using Serilog;
+
+[SupportedOSPlatform("Windows")]
+[GitHubActions(
+    "build",
+    GitHubActionsImage.WindowsLatest,
+    OnPushBranches = ["main"],
+    OnPullRequestBranches = ["main"],
+    InvokedTargets =
+    [
+        nameof(AddNuGetSource),
+        nameof(Compile),
+        nameof(Test),
+    ],
+    ImportSecrets = [nameof(NuGetUsername), nameof(NuGetToken)],
+    FetchDepth = 0)]
+// The release-please workflow starts this workflow on the release tag, after it creates the release. A tag that
+// GITHUB_TOKEN pushes does not start other workflows, but a workflow dispatch does.
+[GitHubActions(
+    "release",
+    GitHubActionsImage.WindowsLatest,
+    On = [GitHubActionsTrigger.WorkflowDispatch],
+    InvokedTargets = [nameof(AddNuGetSource), nameof(Release)],
+    ImportSecrets = [nameof(GitHubToken), nameof(NuGetUsername), nameof(NuGetToken)],
+    EnableGitHubToken = true,
+    FetchDepth = 0,
+    WritePermissions = [GitHubActionsPermissions.Contents])]
+partial class Build : FalloutBuild
+{
+    /// Support plugins are available for:
+    ///   - JetBrains ReSharper        https://nuke.build/resharper
+    ///   - JetBrains Rider            https://nuke.build/rider
+    ///   - Microsoft VisualStudio     https://nuke.build/visualstudio
+    ///   - Microsoft VSCode           https://nuke.build/vscode
+
+    public static int Main () => Execute<Build>();
+
+    [Parameter("Configuration to build - Default is 'Debug' (local) or 'Release' (server)")]
+    readonly Configuration Configuration = IsLocalBuild ? Configuration.Debug : Configuration.Release;
+
+    [Parameter("The name of the vatSys profile where the plugin will be installed")]
+    readonly string ProfileName;
+    
+    [Parameter("GitHub token for uploading the plugin to the release")]
+    [Secret]
+    readonly string GitHubToken;
+
+    [Parameter("GitHub username for the NuGet feed")]
+    readonly string NuGetUsername;
+
+    [Parameter("GitHub personal access token (classic) with the read:packages scope, for the NuGet feed")]
+    [Secret]
+    readonly string NuGetToken;
+
+    [GitRepository]
+    readonly GitRepository GitRepository;
+
+    [Parameter("Version to use instead of the version in version.txt (e.g. 1.0.0-rc1)")]
+    readonly string ForceVersion;
+
+    // The NuGet feed that contains the vatSysToolbox package
+    const string NuGetSourceName = "YuKitsune";
+    const string NuGetSourceUrl = "https://nuget.pkg.github.com/YuKitsune/index.json";
+
+    const string ReleasePluginName = "MyPlugin";
+    const string DebugPluginName = "MyPlugin - Debug";
+    const string PluginAssemblyFileName = "MyPlugin.dll";
+
+    // ILRepack does not merge these assemblies into the plugin assembly
+    static readonly string[] RepackExcludedAssemblyFileNames =
+    [
+        // Harmony must stay a separate assembly. Do not merge it into the plugin assembly.
+        // "0Harmony.dll",
+    ];
+
+    string PluginDirectoryName => Configuration == Configuration.Debug ? DebugPluginName : ReleasePluginName;
+
+    AbsolutePath PluginProjectPath => RootDirectory / "source" / "MyPlugin" / "MyPlugin.csproj";
+    AbsolutePath TestsProjectPath => RootDirectory / "source" / "MyPlugin.Tests" / "MyPlugin.Tests.csproj";
+    AbsolutePath PluginBuildOutputDirectory => TemporaryDirectory / "build";
+    // A build without a version uses the short commit hash, so that you can find the commit of the zip file
+    AbsolutePath PluginZipPath => TemporaryDirectory / $"MyPlugin.{GetVersion() ?? GitRepository.Commit[..7]}.zip";
+    AbsolutePath PluginPackageDirectory => TemporaryDirectory / "package";
+
+    // release-please keeps the release version in this file
+    AbsolutePath VersionFilePath => RootDirectory / "version.txt";
+
+    // vatSys paths
+    [Parameter("Path to the vatSys installation")]
+    AbsolutePath VatSysPath { get; }
+    AbsolutePath VatSysSetupDirectory => TemporaryDirectory / "vatsys-setup";
+    AbsolutePath VatSysExePath => VatSysPath ?? VatSysSetupDirectory / "bin" / "vatSys.exe";
+
+    Target DownloadVatSys => _ => _
+        .OnlyWhenStatic(() => VatSysPath == null && !VatSysExePath.FileExists())
+        .Executes(async () =>
+        {
+            var vatSysSetupUrl = "https://vatsys.sawbe.com/downloads/vatSysSetup.zip";
+            var zipPath = TemporaryDirectory / "vatSysSetup.zip";
+            var msiPath = TemporaryDirectory / "vatSysSetup.msi";
+
+            Log.Information("Downloading vatSys from {Url}", vatSysSetupUrl);
+            using var httpClient = new HttpClient();
+            var response = await httpClient.GetAsync(vatSysSetupUrl);
+            response.EnsureSuccessStatusCode();
+            await using var fileStream = File.Create(zipPath);
+            await response.Content.CopyToAsync(fileStream);
+            fileStream.Close();
+
+            Log.Information("Extracting vatSysSetup.zip");
+            ZipFile.ExtractToDirectory(zipPath, TemporaryDirectory, overwriteFiles: true);
+
+            Log.Information("Extracting vatSysSetup.msi");
+            VatSysSetupDirectory.CreateOrCleanDirectory();
+
+            // Use msiexec to extract the MSI contents
+            var msiExtractProcess = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "msiexec",
+                Arguments = $"/a \"{msiPath}\" /qn TARGETDIR=\"{VatSysSetupDirectory}\"",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+
+            if (msiExtractProcess != null)
+            {
+                await msiExtractProcess.WaitForExitAsync();
+                if (msiExtractProcess.ExitCode != 0)
+                {
+                    var error = await msiExtractProcess.StandardError.ReadToEndAsync();
+                    throw new Exception($"Failed to extract MSI: {error}");
+                }
+            }
+
+            if (!VatSysExePath.FileExists())
+                throw new Exception($"vatSys.exe not found at {VatSysExePath}");
+
+            Log.Information("vatSys.exe extracted to {Path}", VatSysExePath);
+        });
+
+    Target AddNuGetSource => _ => _
+        .Description("Adds the GitHub Packages NuGet feed with the GitHub credentials, or updates the credentials.")
+        .Requires(() => NuGetUsername)
+        .Requires(() => NuGetToken)
+        .Executes(() =>
+        {
+            // The .NET CLI can encrypt the password only on Windows
+            var storePasswordInClearText = !OperatingSystem.IsWindows();
+
+            var sourceExists = DotNetTasks.DotNet("nuget list source", logOutput: false)
+                .Any(o => o.Text.Contains(NuGetSourceUrl));
+
+            if (sourceExists)
+            {
+                Log.Information("Updating the credentials of the NuGet source {Name}", NuGetSourceName);
+                DotNetTasks.DotNetNuGetUpdateSource(s => s
+                    .SetName(NuGetSourceName)
+                    .SetSource(NuGetSourceUrl)
+                    .SetUsername(NuGetUsername)
+                    .SetPassword(NuGetToken)
+                    .SetStorePasswordInClearText(storePasswordInClearText));
+            }
+            else
+            {
+                Log.Information("Adding the NuGet source {Name}", NuGetSourceName);
+                DotNetTasks.DotNetNuGetAddSource(s => s
+                    .SetName(NuGetSourceName)
+                    .SetSource(NuGetSourceUrl)
+                    .SetUsername(NuGetUsername)
+                    .SetPassword(NuGetToken)
+                    .SetStorePasswordInClearText(storePasswordInClearText));
+            }
+        });
+
+    Target Compile => _ => _
+        .DependsOn(DownloadVatSys)
+        .DependsOn(AddNuGetSource)
+        .Executes(() =>
+        {
+            var version = GetVersion();
+            Log.Information(
+                "Building version {Version} with configuration {Configuration} to {OutputDirectory}",
+                version ?? "(none)",
+                Configuration,
+                PluginBuildOutputDirectory);
+
+            DotNetTasks.DotNetBuild(s =>
+            {
+                s = s
+                    .SetProjectFile(PluginProjectPath)
+                    .SetConfiguration(Configuration)
+                    .SetOutputDirectory(PluginBuildOutputDirectory)
+                    .SetProperty("VatSysPath", VatSysExePath.Parent.Parent);
+
+                // Without a version, the assembly keeps the version in the project file
+                if (version is null)
+                    return s;
+
+                // The assembly version and the file version cannot have a pre-release label or build metadata
+                var majorMinorPatch = version.Split('-', '+')[0];
+                return s
+                    .SetVersion(version)
+                    .SetAssemblyVersion(majorMinorPatch)
+                    .SetFileVersion(majorMinorPatch)
+                    .SetInformationalVersion(version);
+            });
+        });
+
+    Target Repack => _ => _
+        .DependsOn(Compile)
+        .Executes(() =>
+        {
+            var mainAssembly = PluginBuildOutputDirectory / PluginAssemblyFileName;
+            var assembliesToMerge = PluginBuildOutputDirectory
+                .GlobFiles("*.dll")
+                .Except([mainAssembly, ..RepackExcludedAssemblyFileNames.Select(f => PluginBuildOutputDirectory / f)])
+                .ToArray();
+
+            if (!mainAssembly.FileExists())
+                throw new Exception($"Main assembly not found: {mainAssembly}");
+
+            foreach (var assembly in assembliesToMerge.Where(a => !a.FileExists()))
+                Log.Warning("Assembly not found (will be skipped): {Assembly}", assembly);
+
+            var existingAssemblies = assembliesToMerge.Where(a => a.FileExists()).ToArray();
+            if (existingAssemblies.Length == 0)
+            {
+                Log.Information("No assemblies found to repack, skipping");
+                return;
+            }
+
+            var settings = new ILRepackSettings()
+                .SetAssemblies([mainAssembly.ToString(), ..existingAssemblies.Select(a => a.ToString())])
+                .SetInternalize(false)
+                .SetParallel(true)
+                .SetOutput(mainAssembly.ToString())
+                .SetLib(PluginBuildOutputDirectory.ToString());  // Tell ILRepack where to find referenced assemblies
+
+            Log.Information("Repacking {Count} assemblies into {MainAssembly}", existingAssemblies.Length, mainAssembly);
+            foreach (var assembly in existingAssemblies)
+                Log.Information("  - {Assembly}", assembly.Name);
+
+            ILRepackTasks.ILRepack(settings);
+
+            // Clean up original merged DLLs
+            foreach (var assembly in existingAssemblies)
+            {
+                assembly.DeleteFile();
+                Log.Information("Deleted {Assembly}", assembly);
+            }
+
+            Log.Information("Repack complete");
+        });
+
+    Target Test => _ => _
+        .After(AddNuGetSource)
+        .Executes(() =>
+        {
+            Log.Information("Running tests");
+            DotNetTasks.DotNetTest(s => s
+                .SetProjectFile(TestsProjectPath)
+                .SetConfiguration(Configuration));
+        });
+
+    Target Uninstall => _ => _
+        .Requires(() => ProfileName)
+        .Executes(() =>
+        {
+            var pluginsDirectory = GetVatSysPluginsDirectory(ProfileName);
+            AbsolutePath[] pluginDirectories =
+            [
+                pluginsDirectory / DebugPluginName,
+                pluginsDirectory / ReleasePluginName
+            ];
+
+            foreach (var pluginDirectory in pluginDirectories)
+            {
+                pluginDirectory.DeleteDirectory();
+                Log.Information("Plugin uninstalled from {Directory}", pluginDirectory);
+            }
+        });
+
+    Target Install => _ => _
+        .Requires(() => ProfileName)
+        .DependsOn(Compile)
+        .DependsOn(Repack)
+        .DependsOn(Uninstall)
+        .Executes(() =>
+        {
+            var pluginsDirectory = GetVatSysPluginsDirectory(ProfileName);
+            Log.Information("Installing plugin to {TargetDirectory}", pluginsDirectory);
+
+            if (!pluginsDirectory.Exists())
+                pluginsDirectory.CreateDirectory();
+
+            // Copy plugin assemblies
+            var pluginDirectory = pluginsDirectory / PluginDirectoryName;
+            pluginDirectory.CreateOrCleanDirectory();
+            foreach (var absolutePath in PluginBuildOutputDirectory.GetFiles())
+            {
+                absolutePath.CopyToDirectory(pluginDirectory, ExistsPolicy.MergeAndOverwrite);
+            }
+
+            Log.Information("Plugin installed to {PluginsDirectory}", pluginDirectory);
+        });
+
+    Target Package => _ => _
+        .DependsOn(Compile)
+        .DependsOn(Repack)
+        .DependsOn(Test)
+        .Requires(() => Configuration == Configuration.Release)
+        .Executes(() =>
+        {
+            var unblockDllsScript = RootDirectory / "unblock-dlls.bat";
+            var changelog = RootDirectory / "CHANGELOG.md";
+
+            PluginPackageDirectory.CreateOrCleanDirectory();
+
+            // Copy plugin assemblies
+            foreach (var absolutePath in PluginBuildOutputDirectory.GetFiles().Where(f => f.Extension != ".pdb"))
+            {
+                absolutePath.CopyToDirectory(PluginPackageDirectory, ExistsPolicy.MergeAndOverwrite);
+            }
+
+            unblockDllsScript.CopyToDirectory(PluginPackageDirectory, ExistsPolicy.FileOverwrite);
+
+            // release-please makes the changelog with the first release
+            if (changelog.FileExists())
+                changelog.CopyToDirectory(PluginPackageDirectory, ExistsPolicy.FileOverwrite);
+            else
+                Log.Warning("Changelog not found (will be skipped): {Changelog}", changelog);
+
+            if (GetVersion() is { } version)
+                (PluginPackageDirectory / "version.txt").WriteAllText(version);
+
+            if (PluginZipPath.FileExists())
+                PluginZipPath.DeleteFile();
+
+            Log.Information("Packaging {OutputDirectory} to {ZipPath}", PluginPackageDirectory, PluginZipPath);
+            PluginPackageDirectory.ZipTo(PluginZipPath);
+        });
+
+    Target Release => _ => _
+        .DependsOn(Package)
+        .Requires(() => GitHubToken)
+        .Requires(() => GitRepository)
+        .Requires(() => Configuration == Configuration.Release)
+        .Executes(async () =>
+        {
+            var version = GetVersion();
+            Assert.NotNull(version, "A release needs a version. Run the release on main or on a release tag, or set --force-version");
+            var tagName = $"v{version}";
+
+            // release-please creates the release. This target only uploads the plugin to it.
+            Log.Information("Finding GitHub release {TagName}", tagName);
+
+            var credentials = new Credentials(GitHubToken);
+            var githubClient = new GitHubClient(new ProductHeaderValue("nuke-build"))
+            {
+                Credentials = credentials
+            };
+
+            var repositoryOwner = GitRepository.GetGitHubOwner();
+            var repositoryName = GitRepository.GetGitHubName();
+
+            var release = await githubClient.Repository.Release.Get(repositoryOwner, repositoryName, tagName);
+            Log.Information("Release found: {ReleaseUrl}", release.HtmlUrl);
+
+            // Upload the zip file as an asset
+            using var zipStream = File.OpenRead(PluginZipPath);
+            var assetUpload = new ReleaseAssetUpload
+            {
+                FileName = PluginZipPath.Name,
+                ContentType = "application/zip",
+                RawData = zipStream
+            };
+
+            var asset = await githubClient.Repository.Release.UploadAsset(release, assetUpload);
+            Log.Information("Asset uploaded: {AssetUrl}", asset.BrowserDownloadUrl);
+        });
+
+    static AbsolutePath GetVatSysPluginsDirectory(string profileName)
+    {
+        return GetVatSysProfilePath(profileName) / "Plugins";
+    }
+
+    static AbsolutePath GetVatSysProfilePath(string profileName)
+    {
+        var documentsPath = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+        return Path.Combine(documentsPath, "vatSys Files", "Profiles", profileName);
+    }
+
+    // The version of a release build (e.g., "1.2.3"), or null for all other builds. A build without a version does not
+    // set the version of the assembly.
+    string GetVersion()
+    {
+        if (!string.IsNullOrEmpty(ForceVersion))
+            return ForceVersion;
+
+        var releaseVersion = VersionFilePath.ReadAllText().Trim();
+
+        // A tag build checks out the release commit without a branch. Thus, also use the release version when the
+        // commit has the tag of the release version.
+        var isReleaseBuild =
+            GetBranchName() is "main" or "master" ||
+            GitRepository?.Tags.Contains($"v{releaseVersion}") == true;
+
+        return isReleaseBuild ? releaseVersion : null;
+    }
+
+    // Some CI environments give the branch as a full ref (e.g., "refs/heads/main")
+    string GetBranchName()
+    {
+        const string branchRefPrefix = "refs/heads/";
+        var branch = GitRepository?.Branch;
+        return branch?.StartsWith(branchRefPrefix) == true ? branch[branchRefPrefix.Length..] : branch;
+    }
+}

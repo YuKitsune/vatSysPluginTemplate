@@ -1,0 +1,3 @@
+This file shows that the project is not bootstrapped yet.
+The Bootstrap target runs only when this file exists, and it deletes this file when it is complete.
+See README.md.

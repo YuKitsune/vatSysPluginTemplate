@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "definitions": {
+    "Host": {
+      "type": "string",
+      "enum": [
+        "AppVeyor",
+        "AzurePipelines",
+        "Bamboo",
+        "Bitbucket",
+        "Bitrise",
+        "GitHubActions",
+        "GitLab",
+        "Jenkins",
+        "Rider",
+        "SpaceAutomation",
+        "TeamCity",
+        "Terminal",
+        "TravisCI",
+        "VisualStudio",
+        "VSCode"
+      ]
+    },
+    "ExecutableTarget": {
+      "type": "string",
+      "enum": [
+        "AddNuGetSource",
+        "Bootstrap",
+        "Compile",
+        "DownloadVatSys",
+        "Install",
+        "Package",
+        "Release",
+        "Repack",
+        "Test",
+        "TestCore",
+        "Uninstall"
+      ]
+    },
+    "Verbosity": {
+      "type": "string",
+      "description": "",
+      "enum": [
+        "Verbose",
+        "Normal",
+        "Minimal",
+        "Quiet"
+      ]
+    },
+    "FalloutBuild": {
+      "properties": {
+        "Continue": {
+          "type": "boolean",
+          "description": "Indicates to continue a previously failed build attempt"
+        },
+        "Help": {
+          "type": "boolean",
+          "description": "Shows the help text for this build assembly"
+        },
+        "Host": {
+          "description": "Host for execution. Default is 'automatic'",
+          "$ref": "#/definitions/Host"
+        },
+        "NoLogo": {
+          "type": "boolean",
+          "description": "Disables displaying the NUKE logo"
+        },
+        "Partition": {
+          "type": "string",
+          "description": "Partition to use on CI"
+        },
+        "Plan": {
+          "type": "boolean",
+          "description": "Shows the execution plan (HTML)"
+        },
+        "Profile": {
+          "type": "array",
+          "description": "Defines the profiles to load",
+          "items": {
+            "type": "string"
+          }
+        },
+        "Root": {
+          "type": "string",
+          "description": "Root directory during build execution"
+        },
+        "Skip": {
+          "type": "array",
+          "description": "List of targets to be skipped. Empty list skips all dependencies",
+          "items": {
+            "$ref": "#/definitions/ExecutableTarget"
+          }
+        },
+        "Target": {
+          "type": "array",
+          "description": "List of targets to be invoked. Default is '{default_target}'",
+          "items": {
+            "$ref": "#/definitions/ExecutableTarget"
+          }
+        },
+        "Verbosity": {
+          "description": "Logging verbosity during build execution. Default is 'Normal'",
+          "$ref": "#/definitions/Verbosity"
+        },
+        "BuildProjectFile": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Path to the build project (.csproj) relative to the repository root. Defaults to 'build/_build.csproj' when unset. Read by the Fallout global tool's in-tool runner."
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "properties": {
+        "Configuration": {
+          "type": "string",
+          "enum": [
+            "Debug",
+            "Release"
+          ],
+          "description": "Configuration to build - Default is 'Debug' (local) or 'Release' (server)"
+        },
+        "ForceVersion": {
+          "type": "string",
+          "description": "Version to use instead of the version in version.txt (e.g. 1.0.0-rc1)"
+        },
+        "GitHubToken": {
+          "type": "string",
+          "description": "GitHub token for uploading the plugin to the release",
+          "default": "Secrets must be entered via 'fallout :secrets [profile]'"
+        },
+        "MailboxName": {
+          "type": "string",
+          "description": "The reverse DNS name of the plugin mailbox (e.g. 'dev.example.hold')"
+        },
+        "NuGetToken": {
+          "type": "string",
+          "description": "GitHub personal access token (classic) with the read:packages scope, for the NuGet feed",
+          "default": "Secrets must be entered via 'fallout :secrets [profile]'"
+        },
+        "NuGetUsername": {
+          "type": "string",
+          "description": "GitHub username for the NuGet feed"
+        },
+        "PluginName": {
+          "type": "string",
+          "description": "The display name of the plugin (e.g. 'Hold Plugin')"
+        },
+        "ProfileName": {
+          "type": "string"
+        },
+        "ProjectName": {
+          "type": "string",
+          "description": "The name of the project, the assembly, and the root namespace (e.g. 'HoldPlugin')"
+        },
+        "VatSysPath": {
+          "type": "string",
+          "description": "Path to the vatSys installation"
+        }
+      }
+    },
+    {
+      "$ref": "#/definitions/FalloutBuild"
+    }
+  ]
+}
